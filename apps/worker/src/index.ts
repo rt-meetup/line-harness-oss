@@ -524,14 +524,19 @@ ${longPressBlock}
 app.get('/book', (c) => c.redirect('/?page=book'));
 
 // 404 fallback — API paths return JSON 404, everything else serves from static assets (LIFF/admin)
-app.notFound(async (c) => {
+export const notFoundHandler = async (c: Parameters<typeof app.notFound>[0] extends (ctx: infer C) => unknown ? C : never) => {
   const path = new URL(c.req.url).pathname;
   if (path.startsWith('/api/') || path === '/webhook' || path === '/docs' || path === '/openapi.json') {
     return c.json({ success: false, error: 'Not found' }, 404);
   }
   // Serve static assets (admin dashboard, LIFF pages)
-  return c.env.ASSETS.fetch(c.req.raw);
-});
+  if (c.env.ASSETS && typeof c.env.ASSETS.fetch === 'function') {
+    return c.env.ASSETS.fetch(c.req.raw);
+  }
+  return c.json({ success: false, error: 'Not found' }, 404);
+};
+
+app.notFound(notFoundHandler);
 
 // Scheduled handler for cron triggers — runs for all active LINE accounts
 async function scheduled(
