@@ -8,6 +8,41 @@ interface DatabaseResult {
   databaseName: string;
 }
 
+const TRANSIENT_D1_ERROR = /code[:\s]*10043|cloudflarestatus|temporarily unavailable|internal error|timed out|timeout|fetch failed|network|connection reset/i;
+const D1_RETRY_ATTEMPTS = 3;
+
+function isTransientD1Error(err: unknown): boolean {
+  if (!(err instanceof WranglerError)) return false;
+  const text = `${err.message}\n${err.stderr}`;
+  return TRANSIENT_D1_ERROR.test(text);
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function runD1WithRetry(
+  args: string[],
+  contextLabel: string,
+): Promise<string> {
+  let lastErr: unknown;
+  for (let attempt = 1; attempt <= D1_RETRY_ATTEMPTS; attempt++) {
+    try {
+      return await wrangler(args);
+    } catch (err) {
+      lastErr = err;
+      if (!isTransientD1Error(err) || attempt === D1_RETRY_ATTEMPTS) {
+        throw err;
+      }
+      p.log.warn(
+        `${contextLabel}: Cloudflare D1 の一時エラーのため再試行します (${attempt}/${D1_RETRY_ATTEMPTS})...`,
+      );
+      await sleep(attempt * 2_000);
+    }
+  }
+  throw lastErr;
+}
+
 export async function createDatabase(
   repoDir: string,
   databaseName: string,
@@ -19,7 +54,10 @@ export async function createDatabase(
   s.start("D1 データベース作成中...");
   let databaseId: string;
   try {
-    const output = await wrangler(["d1", "create", databaseName]);
+    const output = await runD1WithRetry(
+      ["d1", "create", databaseName],
+      "D1 データベース作成",
+    );
     // Parse database_id from TOML or JSON format
     const tomlMatch = output.match(/database_id\s*=\s*"([^"]+)"/);
     const jsonMatch = output.match(/"database_id"\s*:\s*"([^"]+)"/);
@@ -38,7 +76,10 @@ export async function createDatabase(
       error.stderr.includes("already exists")
     ) {
       s.stop("D1 データベースは既に存在します");
-      const listOutput = await wrangler(["d1", "list", "--json"]);
+      const listOutput = await runD1WithRetry(
+        ["d1", "list", "--json"],
+        "D1 一覧取得",
+      );
       const databases = JSON.parse(listOutput);
       const db = databases.find(
         (d: { name: string }) => d.name === databaseName,
@@ -81,14 +122,17 @@ export async function createDatabase(
   // Base schema (CREATE IF NOT EXISTS for everything in schema.sql — failing
   // here is fatal because subsequent steps assume the core tables exist).
   try {
-    await wrangler([
-      "d1",
-      "execute",
-      databaseName,
-      "--remote",
-      "--file",
-      schemaFile,
-    ]);
+    await runD1WithRetry(
+      [
+        "d1",
+        "execute",
+        databaseName,
+        "--remote",
+        "--file",
+        schemaFile,
+      ],
+      "ベーススキーマ適用",
+    );
   } catch (err) {
     if (!isBenignSchemaError(err)) {
       s.stop("ベーススキーマ適用に失敗");
@@ -101,14 +145,17 @@ export async function createDatabase(
   // never ran and we should bail rather than silently advance.
   for (const file of migrationFiles) {
     try {
-      await wrangler([
-        "d1",
-        "execute",
-        databaseName,
-        "--remote",
-        "--file",
-        join(migrationsDir, file),
-      ]);
+      await runD1WithRetry(
+        [
+          "d1",
+          "execute",
+          databaseName,
+          "--remote",
+          "--file",
+          join(migrationsDir, file),
+        ],
+        `migration 適用: ${file}`,
+      );
     } catch (err) {
       if (!isBenignSchemaError(err)) {
         s.stop(`migration 失敗: ${file}`);
@@ -122,14 +169,17 @@ export async function createDatabase(
   // placeholder account_id and every API call 404'd) and the user would
   // otherwise hit `no such table: line_accounts` two steps later.
   try {
-    const verify = await wrangler([
-      "d1",
-      "execute",
-      databaseName,
-      "--remote",
-      "--command",
-      "SELECT name FROM sqlite_master WHERE type='table' AND name='line_accounts'",
-    ]);
+    const verify = await runD1WithRetry(
+      [
+        "d1",
+        "execute",
+        databaseName,
+        "--remote",
+        "--command",
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='line_accounts'",
+      ],
+      "テーブル検証",
+    );
     if (!verify.includes("line_accounts")) {
       s.stop("テーブル検証失敗");
       throw new Error(
