@@ -84,3 +84,4 @@ WORKER_PUBLIC_URL = "https://your-worker-name.workers.dev"
 ADMIN_PUBLIC_URL = "https://line-harness-admin.pages.dev"
 LIFF_PUBLIC_URL = "https://line-harness-liff.pages.dev"
 CF_ACCOUNT_ID = "YOUR_ACCOUNT_ID"
+# test
