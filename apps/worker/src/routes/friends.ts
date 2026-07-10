@@ -44,7 +44,7 @@ const friends = new Hono<Env>();
  */
 friends.post('/api/friends/import-csv', requireRole('owner', 'admin'), async (c) => {
   try {
-    const body = await c.req.json<{ lineAccountId?: string; csv?: string; tagNames?: string[] }>();
+    const body = await c.req.json<{ lineAccountId?: string; csv?: string; tagNames?: string[]; tagColumnMap?: Record<string, string> }>();
     if (!body.lineAccountId) {
       return c.json({ success: false, error: 'lineAccountId is required' }, 400);
     }
@@ -80,19 +80,76 @@ friends.post('/api/friends/import-csv', requireRole('owner', 'admin'), async (c)
       return out.map((s) => s.trim());
     }
 
-    const lines = body.csv.split(/\r\n|\n|\r/).filter((l) => l.length > 0);
-    if (lines.length < 2) {
+    const allLines = body.csv.split(/\r\n|\n|\r/).filter((l) => l.length > 0);
+    if (allLines.length < 2) {
       return c.json({ success: false, error: 'csv must have a header row plus at least one data row' }, 400);
     }
-    const header = parseCsvLine(lines[0]).map((h) => h.toLowerCase());
-    const idIdx = header.indexOf('line_user_id');
-    if (idIdx === -1) {
-      return c.json({ success: false, error: 'csv header must include a "line_user_id" column' }, 400);
+
+    // Some exports (e.g. エルメ) prepend a decorative category row before the
+    // real header (e.g. `"ID","","タグ_1486836",...`). Detect this by looking
+    // for a row that contains an ID-alias column but the SECOND row also does
+    // and looks more like real column names. Heuristic: try row 0 as header;
+    // if it doesn't contain any recognized id/name alias, try row 1 instead
+    // and treat row 0 as decorative.
+    const ID_ALIASES = ['line_user_id', 'ユーザーid', 'ユーザーID'.toLowerCase()];
+    const NAME_ALIASES = ['display_name', 'line表示名', 'line 表示名', '表示名', 'name'];
+    function findIdIdx(header: string[]): number {
+      const normalized = header.map((h) => h.trim().toLowerCase());
+      for (const alias of ID_ALIASES) {
+        const idx = normalized.indexOf(alias);
+        if (idx !== -1) return idx;
+      }
+      return -1;
     }
-    const nameIdx = header.indexOf('display_name');
+
+    let headerRowIndex = 0;
+    let header = parseCsvLine(allLines[0]).map((h) => h.trim().toLowerCase());
+    if (findIdIdx(parseCsvLine(allLines[0])) === -1 && allLines.length > 1) {
+      const secondRowIdIdx = findIdIdx(parseCsvLine(allLines[1]));
+      if (secondRowIdIdx !== -1) {
+        headerRowIndex = 1;
+        header = parseCsvLine(allLines[1]).map((h) => h.trim().toLowerCase());
+      }
+    }
+    const lines = allLines.slice(headerRowIndex);
+
+    const rawHeaderCols = parseCsvLine(allLines[headerRowIndex]);
+    const idIdx = findIdIdx(rawHeaderCols);
+    if (idIdx === -1) {
+      return c.json({ success: false, error: 'csv header must include a line_user_id column (line_user_id / ユーザーID)' }, 400);
+    }
+    let nameIdx = -1;
+    for (const alias of NAME_ALIASES) {
+      const idx = header.indexOf(alias);
+      if (idx !== -1) { nameIdx = idx; break; }
+    }
+
+    // Tag columns: any header starting with "タグ_" (or "tag_") is treated as
+    // a per-row boolean flag column ("1" = has this tag). The suffix after
+    // the prefix is the tag *label* as it appears in the source export; it
+    // may not exactly match the L Harness tag name (e.g. エルメ's
+    // "タグ_その他の職業" vs our "その他"), so `tagColumnMap` lets the caller
+    // supply label -> actual-tag-name overrides. Unmapped labels are looked
+    // up verbatim against the tags table.
+    const tagColumnMap = body.tagColumnMap ?? {};
+    type TagColumn = { colIdx: number; label: string; tagId: string };
+    const tagColumns: TagColumn[] = [];
+    for (let colIdx = 0; colIdx < rawHeaderCols.length; colIdx++) {
+      const raw = rawHeaderCols[colIdx].trim();
+      const m = raw.match(/^(?:タグ_|tag_)(.+)$/i);
+      if (!m) continue;
+      const label = m[1];
+      const tagName = tagColumnMap[label] ?? label;
+      const row = await c.env.DB.prepare(`SELECT id FROM tags WHERE name = ?`).bind(tagName).first<{ id: string }>();
+      if (!row) {
+        return c.json({ success: false, error: `csv column "タグ_${label}" maps to tag "${tagName}", which does not exist — create it first or pass tagColumnMap to remap` }, 400);
+      }
+      tagColumns.push({ colIdx, label, tagId: row.id });
+    }
 
     // Resolve tagNames -> tag ids up front (fail fast on unknown tag names
-    // rather than partway through a 900-row import).
+    // rather than partway through a 900-row import). Applied to EVERY row,
+    // in addition to any per-row tag columns above.
     let tagIds: string[] = [];
     if (body.tagNames && body.tagNames.length > 0) {
       for (const name of body.tagNames) {
@@ -130,12 +187,18 @@ friends.post('/api/friends/import-csv', requireRole('owner', 'admin'), async (c)
         for (const tagId of tagIds) {
           await addTagToFriend(c.env.DB, friend.id, tagId);
         }
+        for (const tc of tagColumns) {
+          const val = (cols[tc.colIdx] ?? '').trim();
+          if (val === '1') {
+            await addTagToFriend(c.env.DB, friend.id, tc.tagId);
+          }
+        }
       } catch (err) {
         errors.push({ row: i + 1, error: err instanceof Error ? err.message : String(err) });
       }
     }
 
-    return c.json({ success: true, data: { created, updated, errorCount: errors.length, errors: errors.slice(0, 20) } });
+    return c.json({ success: true, data: { created, updated, errorCount: errors.length, errors: errors.slice(0, 20), detectedTagColumns: tagColumns.map((t) => t.label) } });
   } catch (err) {
     console.error('POST /api/friends/import-csv error:', err);
     return c.json({ success: false, error: 'Internal server error' }, 500);
